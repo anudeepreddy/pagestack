@@ -32,16 +32,19 @@ import ebooklib.utils as _epub_utils
 # returns b"" (e.g. for EpubNav before its content is written).
 _orig_get_pages = _epub_utils.get_pages
 
+
 def _safe_get_pages(item):
     body = item.get_body_content()
     if not body:
         return []
     return _orig_get_pages(item)
 
+
 _epub_utils.get_pages = _safe_get_pages
 
 try:
     from PIL import Image
+
     HAS_PIL = True
 except ImportError:
     HAS_PIL = False
@@ -67,16 +70,49 @@ def make_session() -> requests.Session:
     return session
 
 
-def fetch_page(url: str, session: requests.Session, timeout: int = 30) -> tuple[str, str]:
+def _extract_meta_refresh_url(html: str, base_url: str) -> str | None:
+    """
+    Extract meta refresh redirect URL from HTML if present.
+    Returns the redirect URL or None if no meta refresh found.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    meta_refresh = soup.find("meta", attrs={"http-equiv": "refresh"})
+    if meta_refresh:
+        content = str(meta_refresh.get("content", ""))
+        # Parse "0;URL=https://example.com" or "0; url=https://example.com"
+        match = re.search(
+            r"(?:\d+);\s*(?:url|URL)\s*=\s*([^;\s\"']+)", content, re.IGNORECASE
+        )
+        if match:
+            redirect_url = match.group(1).strip("\"'")
+            return urljoin(base_url, redirect_url)
+    return None
+
+
+def fetch_page(
+    url: str, session: requests.Session, timeout: int = 30
+) -> tuple[str, str]:
     """Fetch a page. Returns (html_text, final_url_after_redirects)."""
     resp = session.get(url, timeout=timeout, allow_redirects=True)
     resp.raise_for_status()
-    # Honour charset from headers; fallback to apparent encoding
     resp.encoding = resp.apparent_encoding
-    return resp.text, str(resp.url)
+    html = resp.text
+    final_url = str(resp.url)
+
+    # Handle meta refresh redirects (some sites use these instead of HTTP redirects)
+    redirect_url = _extract_meta_refresh_url(html, final_url)
+    if redirect_url and redirect_url != final_url:
+        resp = session.get(redirect_url, timeout=timeout, allow_redirects=True)
+        resp.raise_for_status()
+        resp.encoding = resp.apparent_encoding
+        return resp.text, str(resp.url)
+
+    return html, final_url
 
 
-def fetch_binary(url: str, session: requests.Session, timeout: int = 20) -> tuple[bytes, str] | None:
+def fetch_binary(
+    url: str, session: requests.Session, timeout: int = 20
+) -> tuple[bytes, str] | None:
     """Fetch a binary resource (image). Returns (data, mime_type) or None."""
     try:
         resp = session.get(url, timeout=timeout, allow_redirects=True)
@@ -95,25 +131,136 @@ def fetch_binary(url: str, session: requests.Session, timeout: int = 20) -> tupl
 # Content extraction & cleaning
 # ---------------------------------------------------------------------------
 
+
+def _preprocess_for_readability(html: str) -> str:
+    """
+    Preprocess HTML before readability extraction.
+    - Converts <picture> elements to <img> tags (readability strips <picture>)
+    """
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # Convert <picture> elements to simple <img> tags
+    # Readability strips <picture> entirely, losing the images
+    for picture in soup.find_all("picture"):
+        img = picture.find("img")
+        if img and img.get("src"):
+            # Create new img tag with just the essential attributes
+            new_img = soup.new_tag("img")
+            new_img["src"] = img["src"]
+            if img.get("alt"):
+                new_img["alt"] = img["alt"]
+            if img.get("width"):
+                new_img["width"] = img["width"]
+            if img.get("height"):
+                new_img["height"] = img["height"]
+            picture.replace_with(new_img)
+
+    return str(soup)
+
+
+def _extract_from_article_tag(soup: BeautifulSoup) -> str | None:
+    """
+    Try to extract content directly from <article> tag or common content selectors.
+    Returns the HTML content or None if not found.
+    """
+    # Try <article> tag first
+    article = soup.find("article")
+    if article:
+        # Remove header/footer/nav from article if present (direct children only)
+        for tag in article.find_all(
+            ["header", "footer", "nav", "aside"], recursive=False
+        ):
+            tag.decompose()
+        # Look for common content containers within article (e.g., .body, .markup for Substack)
+        return str(
+            article.find("div", class_="body")
+            or article.find("div", class_="markup")
+            or article
+        )
+
+    # Try common content selectors
+    selectors = [
+        "main",
+        "[role='main']",
+        ".post",
+        ".entry",
+        ".content",
+        ".post-content",
+        ".entry-content",
+        "#content",
+    ]
+    for selector in selectors:
+        try:
+            el = soup.select_one(selector)
+            if el:
+                return str(el)
+        except Exception:
+            pass
+
+    return None
+
+
 def extract_article(html: str, url: str) -> tuple[str, str]:
     """
-    Use readability to pull out the main article body.
+    Extract the main article body.
+    First tries direct article extraction, then falls back to readability.
     Returns (title, body_html).
     """
+    # Preprocess to convert <picture> to <img>
+    html = _preprocess_for_readability(html)
+
+    soup = BeautifulSoup(html, "lxml")
+
+    # Get title first
     doc = Document(html)
     title = doc.short_title() or doc.title() or urlparse(url).netloc
+
+    # Try direct article extraction first (preserves images better)
+    body = _extract_from_article_tag(soup)
+
+    if body and len(body) > 1000:  # Ensure we got substantial content
+        return title.strip(), body
+
+    # Fall back to readability
     body = doc.summary(html_partial=True)
     return title.strip(), body
 
 
-_UNWANTED_TAGS = {"script", "style", "noscript", "iframe", "object",
-                   "embed", "form", "button", "input", "select", "textarea",
-                   "nav", "aside", "footer", "header", "advertisement"}
+_UNWANTED_TAGS = {
+    "script",
+    "style",
+    "noscript",
+    "iframe",
+    "object",
+    "embed",
+    "form",
+    "button",
+    "input",
+    "select",
+    "textarea",
+    "nav",
+    "aside",
+    "footer",
+    "header",
+    "advertisement",
+}
 
 _UNWANTED_ATTRS = {
-    "onclick", "onload", "onerror", "class", "id", "style",
-    "data-src-retina", "data-original", "loading", "decoding",
-    "fetchpriority", "sizes", "crossorigin", "referrerpolicy",
+    "onclick",
+    "onload",
+    "onerror",
+    "class",
+    "id",
+    "style",
+    "data-src-retina",
+    "data-original",
+    "loading",
+    "decoding",
+    "fetchpriority",
+    "sizes",
+    "crossorigin",
+    "referrerpolicy",
 }
 
 
@@ -188,7 +335,9 @@ def process_images(
                 if pil_img.width > max_dim or pil_img.height > max_dim:
                     pil_img.thumbnail((max_dim, max_dim), Image.LANCZOS)
                     buf = io.BytesIO()
-                    fmt = "JPEG" if mime_type == "image/jpeg" else pil_img.format or "PNG"
+                    fmt = (
+                        "JPEG" if mime_type == "image/jpeg" else pil_img.format or "PNG"
+                    )
                     pil_img.save(buf, format=fmt)
                     data = buf.getvalue()
             except Exception:
@@ -436,13 +585,14 @@ def make_chapter_body(title: str, url: str, content_html: str) -> str:
         f'<h1 class="chapter-title">{safe_title}</h1>\n'
         f'<p class="source-url">Source: <a href="{safe_url}">{safe_url}</a></p>\n'
         f'<hr class="chapter-rule"/>\n'
-        f'{content_html}'
+        f"{content_html}"
     )
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
 
 def read_urls(path: Path) -> list[str]:
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -517,7 +667,9 @@ def build_epub(
         chap.add_link(href="styles.css", rel="stylesheet", type="text/css")
         book.add_item(chap)
         chapters.append(chap)
-        print(f"  OK    ({len(clean):,} chars, {sum(1 for k, v in image_cache.items() if v.startswith('images/'))} images total so far)")
+        print(
+            f"  OK    ({len(clean):,} chars, {sum(1 for k, v in image_cache.items() if v.startswith('images/'))} images total so far)"
+        )
 
     if not chapters:
         print("\n[error] No chapters were successfully created.")
@@ -548,9 +700,15 @@ def main():
         default="",
         help="Output EPUB filename (default: derived from title + date)",
     )
-    parser.add_argument("--title", default="", help="Book title (default: auto-generated)")
-    parser.add_argument("--author", default="PageStack", help="Author field in EPUB metadata")
-    parser.add_argument("--timeout", type=int, default=30, help="HTTP request timeout in seconds")
+    parser.add_argument(
+        "--title", default="", help="Book title (default: auto-generated)"
+    )
+    parser.add_argument(
+        "--author", default="PageStack", help="Author field in EPUB metadata"
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=30, help="HTTP request timeout in seconds"
+    )
     args = parser.parse_args()
 
     urls_file = Path(args.urls_file)
